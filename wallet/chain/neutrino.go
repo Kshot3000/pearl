@@ -47,7 +47,6 @@ type NeutrinoClient struct {
 	startTime               time.Time
 	lastProgressSent        bool
 	lastFilteredBlockHeader *wire.BlockHeader
-	currentBlock            chan *waddrmgr.BlockStamp
 
 	quit       chan struct{}
 	rescanQuit chan struct{}
@@ -114,7 +113,6 @@ func (s *NeutrinoClient) Start(ctx context.Context) error {
 		// Reset the client state.
 		s.enqueueNotification = make(chan interface{})
 		s.dequeueNotification = make(chan interface{})
-		s.currentBlock = make(chan *waddrmgr.BlockStamp)
 		s.quit = make(chan struct{})
 		s.started = true
 
@@ -203,15 +201,33 @@ func (s *NeutrinoClient) SyncProgress() (*SyncProgress, error) {
 	}, nil
 }
 
-// BlockStamp returns the latest block notified by the client, or an error
+// BlockStamp returns the chain service's current best block, or an error
 // if the client has been shut down.
+//
+// The best block is read live from the chain service rather than from a
+// snapshot taken when the notification handler started: the handler only
+// learned about new blocks via BlockConnected notifications, so a tip that
+// advanced without one (e.g. the initial sync only produced pre-birthday
+// blocks, or the filter headers were still catching up at startup) would be
+// served stale indefinitely, breaking coin selection with a misleading
+// "insufficient funds" error until the next block arrived.
 func (s *NeutrinoClient) BlockStamp() (*waddrmgr.BlockStamp, error) {
 	select {
-	case bs := <-s.currentBlock:
-		return bs, nil
 	case <-s.quit:
 		return nil, errors.New("disconnected")
+	default:
 	}
+
+	chainTip, err := s.CS.BestBlock()
+	if err != nil {
+		return nil, err
+	}
+
+	return &waddrmgr.BlockStamp{
+		Hash:      chainTip.Hash,
+		Height:    chainTip.Height,
+		Timestamp: chainTip.Timestamp,
+	}, nil
 }
 
 // GetBlockHash returns the block hash for the given height, or an error if the
@@ -752,17 +768,6 @@ func (s *NeutrinoClient) dispatchRescanFinished() {
 // no bounds on the queue, so the dequeue channel should be read continually to
 // avoid running out of memory.
 func (s *NeutrinoClient) notificationHandler() {
-	hash, height, err := s.GetBestBlock()
-	if err != nil {
-		log.Errorf("Failed to get best block from chain service: %s",
-			err)
-		s.Stop()
-		s.wg.Done()
-		return
-	}
-
-	bs := &waddrmgr.BlockStamp{Hash: *hash, Height: height}
-
 	// TODO: Rather than leaving this as an unbounded queue for all types of
 	// notifications, try dropping ones where a later enqueued notification
 	// can fully invalidate one waiting to be processed.  For example,
@@ -798,13 +803,6 @@ out:
 			notifications = append(notifications, n)
 
 		case dequeue <- next:
-			if n, ok := next.(BlockConnected); ok {
-				bs = &waddrmgr.BlockStamp{
-					Height: n.Height,
-					Hash:   n.Hash,
-				}
-			}
-
 			notifications[0] = nil
 			notifications = notifications[1:]
 			if len(notifications) != 0 {
@@ -822,8 +820,6 @@ out:
 			if err != nil {
 				log.Errorf("Neutrino rescan ended with error: %s", err)
 			}
-
-		case s.currentBlock <- bs:
 
 		case <-s.quit:
 			break out
