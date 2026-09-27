@@ -58,11 +58,23 @@ func overviewScreen(c *client) error {
 	}
 
 	lipgloss.Println(th.title.Render("Recent activity"))
-	// listtransactions returns oldest first; show newest at the top.
-	for i := len(recent) - 1; i >= 0; i-- {
-		lipgloss.Println("  " + txRow(recent[i]))
+	// listtransactions returns newest first; print the page in that order so
+	// the newest activity is at the top.
+	for _, row := range recentActivityRows(recent) {
+		lipgloss.Println("  " + row)
 	}
 	return nil
+}
+
+// recentActivityRows renders one line per transaction for the Overview
+// "Recent activity" list. The page comes from listtransactions newest-first,
+// so rows keep that order: newest activity first.
+func recentActivityRows(recent []btcjson.ListTransactionsResult) []string {
+	rows := make([]string, 0, len(recent))
+	for i := range recent {
+		rows = append(rows, txRow(recent[i]))
+	}
+	return rows
 }
 
 // txRow renders one transaction as a compact single line.

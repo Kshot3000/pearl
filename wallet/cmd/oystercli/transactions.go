@@ -41,10 +41,9 @@ func transactionsScreen(c *client) error {
 		}
 
 		opts := make([]huh.Option[string], 0, len(page)+3)
-		// listtransactions returns oldest first within the page.
-		for i := len(page) - 1; i >= 0; i-- {
-			opts = append(opts, huh.NewOption(txRow(page[i]), page[i].TxID))
-		}
+		// listtransactions returns newest first within the page; keep that
+		// order so the newest transaction is the first row.
+		opts = append(opts, txPageOptions(page)...)
 		if len(page) == txPageSize {
 			opts = append(opts, huh.NewOption(th.subtle.Render("→ Older transactions"), txNavNext))
 		}
@@ -86,6 +85,17 @@ func transactionsScreen(c *client) error {
 			}
 		}
 	}
+}
+
+// txPageOptions renders one select option per transaction on the page.
+// listtransactions returns newest first within the page, so the page is
+// shown in the order the wallet returned it: newest transaction first.
+func txPageOptions(page []btcjson.ListTransactionsResult) []huh.Option[string] {
+	opts := make([]huh.Option[string], 0, len(page))
+	for i := range page {
+		opts = append(opts, huh.NewOption(txRow(page[i]), page[i].TxID))
+	}
+	return opts
 }
 
 // showTransactionDetail prints the full record for one transaction.
