@@ -271,11 +271,7 @@ func TestNeutrinoClientNotifyReceivedRescan(t *testing.T) {
 }
 
 // advanceableChainService is a mock chain service whose best block the test
-// can advance without any BlockConnected notification being enqueued. It
-// simulates a chain service that finished syncing after the client's
-// notification handler snapshotted its tip (e.g. the sync only produced
-// pre-birthday blocks, which never enqueue BlockConnected, or the filter
-// headers were still catching up when the handler took its snapshot).
+// can advance without a BlockConnected notification.
 type advanceableChainService struct {
 	mockChainService
 
@@ -296,15 +292,8 @@ func (m *advanceableChainService) setBestBlock(bs *headerfs.BlockStamp) {
 	m.bestBlock = bs
 }
 
-// TestNeutrinoClientBlockStampTracksChainService is a regression test for
-// https://github.com/pearl-research-labs/pearl/issues/322: BlockStamp must
-// reflect the chain service's current best block even when the chain service
-// advances without the notification handler ever observing a BlockConnected
-// notification. Before the fix, the handler snapshotted the tip once at
-// startup and only refreshed it on dequeued BlockConnected notifications, so
-// BlockStamp served a stale height indefinitely and coin selection in
-// createtx.go dropped every UTXO with a misleading "insufficient funds"
-// error until the next block arrived.
+// TestNeutrinoClientBlockStampTracksChainService checks that BlockStamp
+// tracks the chain service tip with no BlockConnected notification (#322).
 func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 	stampAt := func(h int32) *headerfs.BlockStamp {
 		var hash chainhash.Hash
@@ -327,18 +316,13 @@ func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 		nc.WaitForShutdown()
 	}()
 
-	// The handler snapshots the chain service tip at startup.
 	bs, err := nc.BlockStamp()
 	require.NoError(t, err)
 	require.Equal(t, int32(100), bs.Height)
 	require.Equal(t, stampAt(100).Hash, bs.Hash)
 
-	// Advance the chain service tip without any BlockConnected
-	// notification being enqueued.
 	svc.setBestBlock(stampAt(105))
 
-	// BlockStamp must track the live chain service tip rather than the
-	// stale startup snapshot.
 	require.Eventually(t, func() bool {
 		bs, err := nc.BlockStamp()
 		if err != nil {
@@ -348,8 +332,6 @@ func TestNeutrinoClientBlockStampTracksChainService(t *testing.T) {
 	}, maxDur, 10*time.Millisecond,
 		"BlockStamp did not advance with the chain service tip")
 
-	// Once shut down, BlockStamp must report disconnection instead of a
-	// stamp.
 	nc.Stop()
 	nc.WaitForShutdown()
 	_, err = nc.BlockStamp()

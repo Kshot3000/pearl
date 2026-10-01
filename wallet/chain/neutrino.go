@@ -203,16 +203,9 @@ func (s *NeutrinoClient) SyncProgress() (*SyncProgress, error) {
 	}, nil
 }
 
-// BlockStamp returns the chain service's current best block, or an error
-// if the client has been shut down.
-//
-// The best block is read live from the chain service rather than from a
-// snapshot taken when the notification handler started: the handler only
-// learned about new blocks via BlockConnected notifications, so a tip that
-// advanced without one (e.g. the initial sync only produced pre-birthday
-// blocks, or the filter headers were still catching up at startup) would be
-// served stale indefinitely, breaking coin selection with a misleading
-// "insufficient funds" error until the next block arrived.
+// BlockStamp returns the chain service's current best block, or an error if
+// the client has been shut down. It reads CS.BestBlock live rather than a
+// notification-handler snapshot.
 func (s *NeutrinoClient) BlockStamp() (*waddrmgr.BlockStamp, error) {
 	select {
 	case <-s.quit:
