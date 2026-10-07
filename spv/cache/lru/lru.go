@@ -165,6 +165,8 @@ func (c *Cache[K, V]) Put(key K, value V) (bool, error) {
 	// elements if we need more space.
 	evicted, err := c.evict(vs)
 	if err != nil {
+		c.mtx.Unlock()
+
 		return false, err
 	}
 
