@@ -259,16 +259,29 @@ func TestPickStaleOutboundPeer(t *testing.T) {
 		return p
 	}
 
+	tipHash := &chainhash.Hash{0x0a}
+	otherHash := &chainhash.Hash{0x0b}
+
 	low := mkPeer(false, "10.0.0.1:44108", 2)
+	low.UpdateLastAnnouncedBlock(otherHash)
 	mkPeer(false, "10.0.0.2:44108", 5)
 	mkPeer(true, "10.0.0.3:44108", 1)
 
-	assert.Equal(t, low, sm.pickStaleOutboundPeer(10),
+	// A peer advertising a low height whose last announced block is
+	// our tip provably holds the tip — LastBlock is only a lower
+	// bound — so it must never be rotated, even though it advertises
+	// the lowest height of all.
+	quiet := mkPeer(false, "10.0.0.4:44108", 1)
+	quiet.UpdateLastAnnouncedBlock(tipHash)
+
+	assert.Equal(t, low, sm.pickStaleOutboundPeer(10, tipHash),
 		"the lowest strictly-behind outbound peer must be picked")
-	assert.Nil(t, sm.pickStaleOutboundPeer(2),
+	assert.Nil(t, sm.pickStaleOutboundPeer(2, tipHash),
 		"a peer at our height must never be rotated")
-	assert.Nil(t, sm.pickStaleOutboundPeer(0),
+	assert.Nil(t, sm.pickStaleOutboundPeer(0, tipHash),
 		"no peer can be below genesis height")
+	assert.Equal(t, quiet, sm.pickStaleOutboundPeer(10, otherHash),
+		"the announced-tip exemption must follow the actual tip hash")
 }
 
 // TestHandleStallSampleNoSyncPeer pins the stall-sample accounting for

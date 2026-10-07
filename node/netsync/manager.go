@@ -579,7 +579,7 @@ func (sm *SyncManager) handleNoSyncPeer() {
 	}
 
 	best := sm.chain.BestSnapshot()
-	victim := sm.pickStaleOutboundPeer(best.Height)
+	victim := sm.pickStaleOutboundPeer(best.Height, &best.Hash)
 	if victim == nil {
 		return
 	}
@@ -598,10 +598,20 @@ func (sm *SyncManager) handleNoSyncPeer() {
 // for the same next block we are. Inbound peers are never selected:
 // disconnecting one frees no outbound slot for the connection manager
 // to refill.
-func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32) *peerpkg.Peer {
+//
+// LastBlock is only a lower bound on a peer's real height: it is set
+// at the version handshake and advances when the peer announces or
+// serves blocks, so it can lag a peer that quietly holds our tip. A
+// peer whose last announced block is our current tip provably holds
+// that tip whatever its LastBlock says, so it is never selected.
+func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32, bestHash *chainhash.Hash) *peerpkg.Peer {
 	var victim *peerpkg.Peer
 	for peer := range sm.peerStates {
 		if peer.Inbound() || peer.LastBlock() >= bestHeight {
+			continue
+		}
+		if announced := peer.LastAnnouncedBlock(); announced != nil &&
+			announced.IsEqual(bestHash) {
 			continue
 		}
 		if victim == nil || peer.LastBlock() < victim.LastBlock() {
