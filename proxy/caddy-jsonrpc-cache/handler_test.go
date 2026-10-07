@@ -264,3 +264,43 @@ func TestGETRequestsPassthrough(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), backendCalls.Load(), "GET requests should pass through")
 }
+
+// TestUpstreamErrorStatusPreserved: when the upstream answers a cacheable
+// method with a non-200 status (e.g. reverse_proxy returns 502 with a
+// plain-text body while pearld restarts), the middleware must replay that
+// status and body verbatim. Forcing HTTP 200 would tell miners and health
+// checks the call succeeded and hand them a non-JSON body labelled
+// application/json. The response must still not be cached: the next
+// request retries upstream.
+func TestUpstreamErrorStatusPreserved(t *testing.T) {
+	var calls atomic.Int64
+	backend := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		n := calls.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		if n == 1 {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("upstream unavailable"))
+			return nil
+		}
+		resp := jsonrpcResponse{
+			JSONRPC: "2.0",
+			Result:  json.RawMessage(`{"capabilities":{}}`),
+		}
+		out, _ := json.Marshal(resp)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+		return nil
+	})
+
+	h := newTestHandler(CacheRule{Method: "getblocktemplate", TTL: caddy.Duration(5 * time.Second)})
+
+	w1 := doRequest(t, h, backend, "getblocktemplate", 1)
+	assert.Equal(t, http.StatusBadGateway, w1.Code, "upstream 502 must not be rewritten to 200")
+	assert.Equal(t, "upstream unavailable", w1.Body.String())
+	assert.Contains(t, w1.Header().Get("Content-Type"), "text/plain")
+
+	w2 := doRequest(t, h, backend, "getblocktemplate", 2)
+	assert.Equal(t, int64(2), calls.Load(), "non-200 response must not be cached")
+	assert.Equal(t, http.StatusOK, w2.Code)
+}
