@@ -68,3 +68,48 @@ func TestPutEvictErrorUnlocksCache(t *testing.T) {
 		t.Fatal("cache is deadlocked after a failed eviction in Put")
 	}
 }
+
+// TestLoadAndDeleteSizeErrorKeepsEntry ensures that when LoadAndDelete
+// cannot size the entry it was asked to delete, it leaves the cache fully
+// consistent: the entry must still be retrievable by key, still counted
+// in Len/Size, and deletable once Size() works again. Before the fix, the
+// key was removed from the lookup map before sizing, so a Size() error
+// returned "not deleted" while stranding a ghost entry — gone from the
+// map, still occupying the list and the size accounting, unreachable by
+// Get, and double-counted if the same key was Put again.
+func TestLoadAndDeleteSizeErrorKeepsEntry(t *testing.T) {
+	t.Parallel()
+
+	c := NewCache[int, *flakySizeValue](10)
+
+	resident := &flakySizeValue{size: 6}
+	_, err := c.Put(1, resident)
+	require.NoError(t, err)
+
+	// The resident entry's Size() now fails, as CacheableFilter.Size()
+	// can if its filter can no longer be measured.
+	resident.fail = true
+
+	// The delete cannot complete, and must report that it did not.
+	v, ok := c.LoadAndDelete(1)
+	require.False(t, ok)
+	require.Nil(t, v)
+
+	// Nothing may have changed: the entry is still in the cache, by key
+	// and in the accounting.
+	got, err := c.Get(1)
+	require.NoError(t, err)
+	require.Same(t, resident, got)
+	require.Equal(t, 1, c.Len())
+	require.Equal(t, uint64(6), c.Size())
+
+	// Once Size() works again, the same delete succeeds cleanly and the
+	// accounting drains to zero — no ghost is left behind.
+	resident.fail = false
+
+	v, ok = c.LoadAndDelete(1)
+	require.True(t, ok)
+	require.Same(t, resident, v)
+	require.Equal(t, 0, c.Len())
+	require.Equal(t, uint64(0), c.Size())
+}

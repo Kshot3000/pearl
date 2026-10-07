@@ -223,7 +223,7 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 	var defaultVal V
 
 	// Noop if the element doesn't exist.
-	el, ok := c.cache.LoadAndDelete(key)
+	el, ok := c.cache.Load(key)
 	if !ok {
 		return defaultVal, false
 	}
@@ -231,7 +231,20 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 
-	// Get its size.
+	// A concurrent LoadAndDelete may have removed the element while we
+	// waited for the lock. Only proceed if the map still points at the
+	// exact element we loaded; the removal below happens under the same
+	// lock, so exactly one deleter can pass this check.
+	cur, ok := c.cache.Load(key)
+	if !ok || cur != el {
+		return defaultVal, false
+	}
+
+	// Get its size. Nothing has been mutated yet, so if sizing fails
+	// the entry stays fully in the cache — still reachable by key and
+	// still counted — instead of being stranded as a ghost that is
+	// gone from the map but still occupies the list and the size
+	// accounting.
 	vs, err := el.Value.value.Size()
 	if err != nil {
 		return defaultVal, false
@@ -242,7 +255,9 @@ func (c *Cache[K, V]) LoadAndDelete(key K) (V, bool) {
 		cb(key, el.Value.value)
 	})
 
-	// Remove the element from the list and update the cache's size.
+	// Remove the element from the cache and the list, and update the
+	// cache's size.
+	c.cache.Delete(key)
 	c.ll.Remove(el)
 	c.size -= vs
 
