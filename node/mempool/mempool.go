@@ -1595,13 +1595,6 @@ func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 	// Calculate the minimum required fee for this transaction.
 	minFee := calcMinRequiredTxRelayFee(txSize, mp.cfg.Policy.MinRelayTxFee)
 
-	if txFee < minFee {
-		str := fmt.Sprintf("transaction %v has %d fees which is under "+
-			"the required amount of %d", txHash, txFee, minFee)
-
-		return txRuleError(wire.RejectInsufficientFee, str)
-	}
-
 	// Exit early if the min relay fee is met.
 	if txFee >= minFee {
 		return nil
