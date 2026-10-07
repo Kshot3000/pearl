@@ -345,9 +345,10 @@ func TestHandleNoSyncPeerAtTip(t *testing.T) {
 }
 
 // TestAnyPeerAnnouncedUnknownBlock pins the rotation stand-down
-// signal: a connected peer that announced a block we do not have is
-// proof of reachable work, so rotation must not churn the peer set
-// while selection retries are still working through the candidates.
+// signal: an eligible sync candidate that announced a block we do
+// not have is evidence of reachable work, so rotation must not
+// churn the peer set while selection retries are still working
+// through the candidates.
 func TestAnyPeerAnnouncedUnknownBlock(t *testing.T) {
 	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
 	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
@@ -367,6 +368,107 @@ func TestAnyPeerAnnouncedUnknownBlock(t *testing.T) {
 	p.UpdateLastAnnouncedBlock(&unknown)
 	assert.True(t, sm.anyPeerAnnouncedUnknownBlock(),
 		"the announced block is one we do not have")
+}
+
+// TestAnyPeerAnnouncedUnknownBlockEligibility pins which
+// announcements may stand rotation down. LastAnnouncedBlock is
+// written from an unauthenticated inv before any quality gate and
+// is only cleared when a matching block is accepted, so an
+// announcement may only count from a peer startSync could actually
+// promote on a coming sample: outbound, a sync candidate,
+// high-quality, and not in post-stall cooldown. Anything else —
+// above all a fake inv from an inbound peer, which is never
+// promoted while outbound candidates exist — must not freeze
+// rotation for the whole stranded window.
+func TestAnyPeerAnnouncedUnknownBlockEligibility(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	unknown := chainhash.Hash{0x07}
+
+	mkPeer := func(inbound bool, addr string, state *peerSyncState) *peer.Peer {
+		t.Helper()
+		cfg := &peer.Config{ChainParams: sm.chainParams}
+		var p *peer.Peer
+		if inbound {
+			p = peer.NewInboundPeer(cfg)
+		} else {
+			var err error
+			p, err = peer.NewOutboundPeer(cfg, addr)
+			require.NoError(t, err)
+		}
+		p.UpdateLastAnnouncedBlock(&unknown)
+		sm.peerStates[p] = state
+		return p
+	}
+
+	// Inbound announcer: never counts, even as a high-quality
+	// candidate — pickSyncCandidate will not promote it while
+	// outbound candidates exist.
+	mkPeer(true, "", &peerSyncState{syncCandidate: true})
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"an inbound announcement must not stand rotation down")
+
+	// Outbound but not a sync candidate.
+	mkPeer(false, "10.0.0.1:44108", &peerSyncState{syncCandidate: false})
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"a non-candidate announcement must not stand rotation down")
+
+	// Outbound candidate that has struck out to low quality: its
+	// announcements are gated through the getheaders probe, not
+	// acted on as sync evidence.
+	mkPeer(false, "10.0.0.2:44108", &peerSyncState{
+		syncCandidate: true, nonTipStrikes: lowQualityStrikeLimit,
+	})
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"a low-quality announcement must not stand rotation down")
+
+	// Eligible announcer in post-stall cooldown: startSync skips
+	// it, so its stale announcement must not stand rotation down
+	// either — this is what bounds the stand-down after a promoted
+	// announcer stalls without delivering its block.
+	cooling := mkPeer(false, "10.0.0.3:44108",
+		&peerSyncState{syncCandidate: true})
+	sm.recentlyFailedSync[cooling.Addr()] = time.Now()
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"a cooling-down announcement must not stand rotation down")
+
+	// The same announcer with the cooldown expired counts again.
+	sm.recentlyFailedSync[cooling.Addr()] =
+		time.Now().Add(-syncPeerCooldown - time.Second)
+	assert.True(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"an eligible announcement with an expired cooldown counts")
+}
+
+// TestAtTipSyncPromotionBlocked pins the at-tip promotion bar:
+// while the chain is current, no candidate may be promoted in a way
+// that flips current() false — neither on its unauthenticated
+// version height alone, nor on an unverified announced hash paired
+// with an advertised height above ours. The honest next-block
+// announcer (announced a block we lack, advertised height at or
+// below ours, because its LastBlock only advances on blocks we
+// accepted) is still promoted, and nothing is barred once the
+// chain is not current.
+func TestAtTipSyncPromotionBlocked(t *testing.T) {
+	unknown := &chainhash.Hash{0x07}
+
+	assert.False(t, atTipSyncPromotionBlocked(false, nil, 100, 10),
+		"not current: a height claim still promotes")
+	assert.False(t, atTipSyncPromotionBlocked(false, unknown, 100, 10),
+		"not current: an announced block still promotes")
+
+	assert.True(t, atTipSyncPromotionBlocked(true, nil, 100, 10),
+		"current + height claim only: blocked")
+	assert.True(t, atTipSyncPromotionBlocked(true, nil, 10, 10),
+		"current + no announcement: blocked at any height")
+
+	assert.True(t, atTipSyncPromotionBlocked(true, unknown, 11, 10),
+		"current + announced block + advertised height above ours: "+
+			"blocked, the promotion would flip current() false")
+	assert.False(t, atTipSyncPromotionBlocked(true, unknown, 10, 10),
+		"current + announced block + advertised height at ours: "+
+			"promoted, current() stays true")
+	assert.False(t, atTipSyncPromotionBlocked(true, unknown, 9, 10),
+		"current + announced block + advertised height below ours: "+
+			"promoted, current() stays true")
 }
 
 // TestStartSyncPromotesHeightClaimWhenNotCurrent pins that the at-tip
