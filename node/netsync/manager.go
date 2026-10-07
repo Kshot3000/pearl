@@ -393,6 +393,23 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
+	// While the chain believes it is current, a candidate whose only
+	// claim to new work is its version-message height must not be
+	// promoted on that claim alone. The height is unauthenticated,
+	// and promoting the peer would make current() false (our best
+	// would be below the sync peer's advertised height), which makes
+	// handleInvMsg ignore every other peer's announcements until the
+	// stall timer fires. A candidate that announced a block we do
+	// not have (checked above) is still promoted: that announcement
+	// is how a synced node normally learns about the next block.
+	if sm.chain.IsCurrent() && bestPeer.LastAnnouncedBlock() == nil {
+		log.Debugf("Skipping sync: candidate %s advertises "+
+			"height %d but announced no new block and the "+
+			"chain is current", bestPeer.Addr(),
+			bestPeer.LastBlock())
+		return
+	}
+
 	// Clear the requestedBlocks if the sync peer changes, otherwise
 	// we may ignore blocks we need that the last sync peer failed
 	// to send.
@@ -525,14 +542,16 @@ func (sm *SyncManager) handleStallSample() {
 	// gating re-selection on !IsCurrent left it with no sync peer
 	// for that whole window (#301). startSync itself skips
 	// candidates that have nothing new to offer, so the retry is
-	// cheap when we are genuinely at tip.
+	// cheap when we are genuinely at tip — and while current it
+	// only promotes a candidate that announced a block we do not
+	// have, never one claiming new work by version height alone.
 	if sm.syncPeer == nil {
 		sm.startSync()
 		if sm.syncPeer != nil {
 			sm.noSyncPeerSamples = 0
 			return
 		}
-		sm.handleNoSyncPeer()
+		sm.handleNoSyncPeer(sm.chain.IsCurrent())
 		return
 	}
 	sm.noSyncPeerSamples = 0
@@ -572,9 +591,38 @@ func (sm *SyncManager) handleStallSample() {
 // behind it (e.g. nodes stranded on the far side of a hardfork) can
 // never make progress: startSync only considers connected peers, and
 // nothing ever rotates the useless ones out (#301).
-func (sm *SyncManager) handleNoSyncPeer() {
+//
+// Rotation only runs while the chain is not current. A node at a
+// fresh tip with no sync peer is the normal steady state, not the
+// wedge: its outbound peers' advertised heights lag the tip by
+// construction (LastBlock is set at handshake and only advances on
+// announcements), so rotating there would churn healthy connections
+// for no possible gain — no peer can serve a block that has not been
+// mined yet. The wedge is a node that is behind and stranded, and
+// that state always comes with a stale tip. The streak is reset, not
+// merely paused, so the grace period restarts when the node actually
+// becomes stranded.
+//
+// Rotation also stands down while any connected peer has announced a
+// block we do not have. Such an announcement is proof that reachable
+// work exists, whatever the advertised heights say: startSync picks
+// one random candidate per sample, so a viable candidate can take
+// several samples to be picked, and the inv path fetches
+// announcements directly while there is no sync peer. Rotating in
+// that window could churn the very peer set that is about to
+// un-wedge the node.
+func (sm *SyncManager) handleNoSyncPeer(isCurrent bool) {
+	if isCurrent {
+		sm.noSyncPeerSamples = 0
+		return
+	}
+
 	sm.noSyncPeerSamples++
 	if sm.noSyncPeerSamples < noSyncPeerRotateSamples {
+		return
+	}
+
+	if sm.anyPeerAnnouncedUnknownBlock() {
 		return
 	}
 
@@ -590,6 +638,22 @@ func (sm *SyncManager) handleNoSyncPeer() {
 		time.Duration(sm.noSyncPeerSamples)*stallSampleInterval,
 		victim.Addr(), victim.LastBlock(), best.Height)
 	victim.Disconnect()
+}
+
+// anyPeerAnnouncedUnknownBlock reports whether any connected peer's
+// last announced block is one we do not have — proof that reachable
+// work exists, whatever the peers' advertised heights say.
+func (sm *SyncManager) anyPeerAnnouncedUnknownBlock() bool {
+	for peer := range sm.peerStates {
+		announced := peer.LastAnnouncedBlock()
+		if announced == nil {
+			continue
+		}
+		if have, _ := sm.chain.HaveBlock(announced); !have {
+			return true
+		}
+	}
+	return false
 }
 
 // pickStaleOutboundPeer returns the outbound peer advertising the

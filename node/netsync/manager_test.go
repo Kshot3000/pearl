@@ -315,6 +315,76 @@ func TestHandleStallSampleNoSyncPeer(t *testing.T) {
 	assert.True(t, p.Connected())
 }
 
+// TestHandleNoSyncPeerAtTip pins that the no-candidate rotation never
+// runs while the chain believes it is current: at a fresh tip, having
+// no sync peer is the normal steady state and the outbound peers'
+// advertised heights lag the tip by construction, so there is nothing
+// to rotate for. The streak is reset, not merely paused, so the grace
+// period restarts when the node actually becomes stranded. The
+// genesis-only test chain is never current, so the current case is
+// posed by passing the flag explicitly — the same way
+// TestPickStaleOutboundPeer poses the tip height.
+func TestHandleNoSyncPeerAtTip(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	require.False(t, sm.chain.IsCurrent())
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	sm.handleNewPeerMsg(p)
+	require.Nil(t, sm.syncPeer)
+
+	sm.noSyncPeerSamples = noSyncPeerRotateSamples + 5
+	sm.handleNoSyncPeer(true)
+	assert.Equal(t, 0, sm.noSyncPeerSamples,
+		"a current chain must reset the no-candidate streak")
+	assert.True(t, p.Connected(),
+		"no peer may be rotated while the chain is current")
+
+	// Not current: the streak counts again from zero.
+	sm.handleNoSyncPeer(false)
+	assert.Equal(t, 1, sm.noSyncPeerSamples)
+}
+
+// TestAnyPeerAnnouncedUnknownBlock pins the rotation stand-down
+// signal: a connected peer that announced a block we do not have is
+// proof of reachable work, so rotation must not churn the peer set
+// while selection retries are still working through the candidates.
+func TestAnyPeerAnnouncedUnknownBlock(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"no peers connected")
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	sm.handleNewPeerMsg(p)
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"peer has announced nothing")
+
+	tip := sm.chain.BestSnapshot().Hash
+	p.UpdateLastAnnouncedBlock(&tip)
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"the announced block is our own tip")
+
+	unknown := chainhash.Hash{0x07}
+	p.UpdateLastAnnouncedBlock(&unknown)
+	assert.True(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"the announced block is one we do not have")
+}
+
+// TestStartSyncPromotesHeightClaimWhenNotCurrent pins that the at-tip
+// promotion guard does not weaken syncing on a version-height claim
+// while the chain is not current (IBD / stranded): a lone outbound
+// candidate advertising a height above ours is promoted on that claim
+// alone, exactly as before the guard.
+func TestStartSyncPromotesHeightClaimWhenNotCurrent(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	require.False(t, sm.chain.IsCurrent())
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	p.UpdateLastBlockHeight(5)
+	sm.handleNewPeerMsg(p)
+	require.Equal(t, p, sm.syncPeer,
+		"a height claim must still promote while the chain is not current")
+}
+
 // TestIsSyncCandidate pins the services a peer must advertise to be a sync candidate. Regtest gets no localhost
 // exemption: an integration harness that wants to feed blocks has to advertise that it serves them.
 func TestIsSyncCandidate(t *testing.T) {
