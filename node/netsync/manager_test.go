@@ -234,6 +234,74 @@ func TestInvGateWithoutSyncPeer(t *testing.T) {
 	}
 }
 
+// TestPickStaleOutboundPeer pins which peers the no-candidate rotation
+// may evict (#301): outbound peers only, strictly below our height,
+// lowest advertised height first. A peer at our height is never
+// selected — it may simply be waiting for the same next block we are —
+// and an inbound peer is never selected because disconnecting one
+// frees no outbound slot for the connection manager to refill.
+func TestPickStaleOutboundPeer(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+
+	mkPeer := func(inbound bool, addr string, height int32) *peer.Peer {
+		t.Helper()
+		cfg := &peer.Config{ChainParams: sm.chainParams}
+		var p *peer.Peer
+		if inbound {
+			p = peer.NewInboundPeer(cfg)
+		} else {
+			var err error
+			p, err = peer.NewOutboundPeer(cfg, addr)
+			require.NoError(t, err)
+		}
+		p.UpdateLastBlockHeight(height)
+		sm.peerStates[p] = &peerSyncState{syncCandidate: true}
+		return p
+	}
+
+	low := mkPeer(false, "10.0.0.1:44108", 2)
+	mkPeer(false, "10.0.0.2:44108", 5)
+	mkPeer(true, "10.0.0.3:44108", 1)
+
+	assert.Equal(t, low, sm.pickStaleOutboundPeer(10),
+		"the lowest strictly-behind outbound peer must be picked")
+	assert.Nil(t, sm.pickStaleOutboundPeer(2),
+		"a peer at our height must never be rotated")
+	assert.Nil(t, sm.pickStaleOutboundPeer(0),
+		"no peer can be below genesis height")
+}
+
+// TestHandleStallSampleNoSyncPeer pins the stall-sample accounting for
+// the #301 wedge: with no sync peer, selection is retried on every
+// sample even though startSync keeps finding no viable candidate, the
+// no-candidate streak keeps counting, a peer at our own height is never
+// disconnected no matter how long the streak runs, and the streak
+// resets once a sync peer exists again.
+func TestHandleStallSampleNoSyncPeer(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	sm.handleNewPeerMsg(p)
+	require.Nil(t, sm.syncPeer, "a peer at our height must not be picked as sync peer")
+
+	samples := noSyncPeerRotateSamples + 5
+	for i := 0; i < samples; i++ {
+		sm.handleStallSample()
+	}
+	assert.Equal(t, samples, sm.noSyncPeerSamples,
+		"every candidate-less sample must extend the streak")
+	assert.True(t, p.Connected(),
+		"a peer at our height must not be rotated out")
+
+	// Once a sync peer exists the streak resets; the peer is at our
+	// height, so the stall path must not disconnect it either.
+	sm.syncPeer = p
+	sm.handleStallSample()
+	assert.Equal(t, 0, sm.noSyncPeerSamples,
+		"having a sync peer must reset the streak")
+	assert.True(t, p.Connected())
+}
+
 // TestIsSyncCandidate pins the services a peer must advertise to be a sync candidate. Regtest gets no localhost
 // exemption: an integration harness that wants to feed blocks has to advertise that it serves them.
 func TestIsSyncCandidate(t *testing.T) {

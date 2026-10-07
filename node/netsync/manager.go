@@ -51,6 +51,14 @@ const (
 	// is excluded from re-selection.
 	syncPeerCooldown = 10 * time.Minute
 
+	// noSyncPeerRotateSamples is the number of consecutive stall
+	// samples with no sync peer and no viable candidate after which
+	// handleStallSample starts rotating out outbound peers that
+	// advertise a height below ours (see handleNoSyncPeer). At
+	// stallSampleInterval per sample this is a 5-minute grace period
+	// before the first rotation.
+	noSyncPeerRotateSamples = 10
+
 	// lowQualityStrikeLimit is the strike count at which a peer is
 	// downgraded back to low-quality (see nonTipStrikes).
 	lowQualityStrikeLimit = 5
@@ -248,6 +256,11 @@ type SyncManager struct {
 	// while serving as syncnode. pickSyncCandidate skips entries
 	// within syncPeerCooldown and lazy-evicts expired ones.
 	recentlyFailedSync map[string]time.Time
+
+	// noSyncPeerSamples counts consecutive stall samples on which no
+	// sync peer could be selected. Reset whenever a sync peer exists.
+	// Only accessed from the blockHandler thread (handleStallSample).
+	noSyncPeerSamples int
 }
 
 // resetHeaderState sets the headers-first mode state to values appropriate for
@@ -506,13 +519,23 @@ func (sm *SyncManager) handleStallSample() {
 	}
 
 	// No syncpeer — retry selection periodically so cooled-down
-	// candidates get re-evaluated as their entries expire.
+	// candidates get re-evaluated as their entries expire. Selection
+	// is attempted regardless of IsCurrent: a node that loses its
+	// sync peer while at tip still looks current for up to 24h, and
+	// gating re-selection on !IsCurrent left it with no sync peer
+	// for that whole window (#301). startSync itself skips
+	// candidates that have nothing new to offer, so the retry is
+	// cheap when we are genuinely at tip.
 	if sm.syncPeer == nil {
-		if !sm.chain.IsCurrent() {
-			sm.startSync()
+		sm.startSync()
+		if sm.syncPeer != nil {
+			sm.noSyncPeerSamples = 0
+			return
 		}
+		sm.handleNoSyncPeer()
 		return
 	}
+	sm.noSyncPeerSamples = 0
 
 	// If the stall timeout has not elapsed, exit early.
 	if time.Since(sm.lastProgressTime) <= maxStallDuration {
@@ -536,6 +559,56 @@ func (sm *SyncManager) handleStallSample() {
 
 	disconnectSyncPeer := sm.shouldDCStalledSyncPeer()
 	sm.updateSyncPeer(disconnectSyncPeer)
+}
+
+// handleNoSyncPeer runs on a stall sample where startSync found no
+// viable sync candidate. Once that state persists for
+// noSyncPeerRotateSamples consecutive samples, it disconnects one
+// outbound peer that advertises a height below ours per sample,
+// freeing its outbound slot so the connection manager dials a
+// replacement that may be able to serve us blocks.
+//
+// Without this, a node whose outbound slots are all held by peers
+// behind it (e.g. nodes stranded on the far side of a hardfork) can
+// never make progress: startSync only considers connected peers, and
+// nothing ever rotates the useless ones out (#301).
+func (sm *SyncManager) handleNoSyncPeer() {
+	sm.noSyncPeerSamples++
+	if sm.noSyncPeerSamples < noSyncPeerRotateSamples {
+		return
+	}
+
+	best := sm.chain.BestSnapshot()
+	victim := sm.pickStaleOutboundPeer(best.Height)
+	if victim == nil {
+		return
+	}
+
+	log.Infof("No sync candidate for %v — disconnecting outbound "+
+		"peer %s at height %d (our best is %d) to free the slot "+
+		"for a replacement",
+		time.Duration(sm.noSyncPeerSamples)*stallSampleInterval,
+		victim.Addr(), victim.LastBlock(), best.Height)
+	victim.Disconnect()
+}
+
+// pickStaleOutboundPeer returns the outbound peer advertising the
+// lowest height strictly below bestHeight, or nil if there is none.
+// Peers at our height are never selected: they may simply be waiting
+// for the same next block we are. Inbound peers are never selected:
+// disconnecting one frees no outbound slot for the connection manager
+// to refill.
+func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32) *peerpkg.Peer {
+	var victim *peerpkg.Peer
+	for peer := range sm.peerStates {
+		if peer.Inbound() || peer.LastBlock() >= bestHeight {
+			continue
+		}
+		if victim == nil || peer.LastBlock() < victim.LastBlock() {
+			victim = peer
+		}
+	}
+	return victim
 }
 
 // shouldDCStalledSyncPeer determines whether or not we should disconnect a
