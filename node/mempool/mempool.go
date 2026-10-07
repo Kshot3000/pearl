@@ -907,7 +907,7 @@ func (mp *TxPool) maybeAcceptTransaction(tx *btcutil.Tx, isNew, rateLimit,
 
 	// Check for mempool acceptance.
 	r, err := mp.checkMempoolAcceptance(
-		tx, isNew, rateLimit, rejectDupOrphans,
+		tx, isNew, rateLimit, rejectDupOrphans, false,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -1286,7 +1286,14 @@ func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (
 	// which has the effect that we always check the fee paid from this tx
 	// is greater than min relay fee. We also reject this tx if it's
 	// already an orphan.
-	result, err := mp.checkMempoolAcceptance(tx, true, true, true)
+	//
+	// This is a dry run: the transaction is never inserted, and this
+	// function holds only the read lock, so the final dryRun argument
+	// tells the free-relay rate limiter to evaluate the transaction
+	// against the current budget without charging it (charging here
+	// would both consume the budget for a transaction that was never
+	// accepted and race on the limiter state under the read lock).
+	result, err := mp.checkMempoolAcceptance(tx, true, true, true, true)
 	if err != nil {
 		log.Errorf("CheckMempoolAcceptance: %v", err)
 		return nil, err
@@ -1302,7 +1309,8 @@ func (mp *TxPool) CheckMempoolAcceptance(tx *btcutil.Tx) (
 // transaction. It returns an error when the transaction fails to meet the
 // mempool policy, otherwise a `mempoolAcceptResult` is returned.
 func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
-	isNew, rateLimit, rejectDupOrphans bool) (*MempoolAcceptResult, error) {
+	isNew, rateLimit, rejectDupOrphans, dryRun bool) (
+	*MempoolAcceptResult, error) {
 
 	txHash := tx.Hash()
 
@@ -1494,6 +1502,7 @@ func (mp *TxPool) checkMempoolAcceptance(tx *btcutil.Tx,
 	// block.
 	err = mp.validateRelayFeeMet(
 		tx, txFee, txSize, utxoView, nextBlockHeight, isNew, rateLimit,
+		dryRun,
 	)
 	if err != nil {
 		return nil, err
@@ -1585,10 +1594,13 @@ func (mp *TxPool) validateStandardness(tx *btcutil.Tx, nextBlockHeight int32,
 }
 
 // validateRelayFeeMet checks that the min relay fee is covered by this
-// transaction.
+// transaction. When dryRun is set the free-relay rate limiter is only
+// evaluated against the current budget: the transaction is not charged
+// and the limiter state is not mutated, since the caller holds only
+// the read lock and the transaction will not be inserted.
 func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 	utxoView *blockchain.UtxoViewpoint, nextBlockHeight int32,
-	isNew, rateLimit bool) error {
+	isNew, rateLimit, dryRun bool) error {
 
 	txHash := tx.Hash()
 
@@ -1611,18 +1623,30 @@ func (mp *TxPool) validateRelayFeeMet(tx *btcutil.Tx, txFee, txSize int64,
 	nowUnix := time.Now().Unix()
 
 	// Decay passed data with an exponentially decaying ~10 minute window -
-	// matches bitcoind handling.
-	mp.pennyTotal *= math.Pow(
+	// matches bitcoind handling. The decayed total is computed in a
+	// local first: a dry run must leave the limiter state untouched,
+	// while a real acceptance commits the decay (even when the limiter
+	// then rejects) exactly as before.
+	pennyTotal := mp.pennyTotal * math.Pow(
 		1.0-1.0/600.0, float64(nowUnix-mp.lastPennyUnix),
 	)
-	mp.lastPennyUnix = nowUnix
+	if !dryRun {
+		mp.pennyTotal = pennyTotal
+		mp.lastPennyUnix = nowUnix
+	}
 
 	// Are we still over the limit?
-	if mp.pennyTotal >= mp.cfg.Policy.FreeTxRelayLimit*10*1000 {
+	if pennyTotal >= mp.cfg.Policy.FreeTxRelayLimit*10*1000 {
 		str := fmt.Sprintf("transaction %v has been rejected "+
 			"by the rate limiter due to low fees", txHash)
 
 		return txRuleError(wire.RejectInsufficientFee, str)
+	}
+
+	// A dry run is admitted against the current budget but never
+	// charged: the transaction is not entering the pool.
+	if dryRun {
+		return nil
 	}
 
 	oldTotal := mp.pennyTotal
