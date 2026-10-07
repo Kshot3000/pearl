@@ -421,6 +421,13 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 		var signOutput *wire.TxOut
 		if in.NonWitnessUtxo != nil {
 			prevIndex := txIn.PreviousOutPoint.Index
+			if prevIndex >= uint32(len(in.NonWitnessUtxo.TxOut)) {
+				return fmt.Errorf("input %d has malformed "+
+					"NonWitnessUtxo: unsigned tx spends "+
+					"output index %d but the previous tx "+
+					"has only %d outputs", idx, prevIndex,
+					len(in.NonWitnessUtxo.TxOut))
+			}
 			signOutput = in.NonWitnessUtxo.TxOut[prevIndex]
 
 			if !psbt.TxOutsEqual(txOut, signOutput) {
@@ -522,6 +529,13 @@ func PsbtPrevOutputFetcher(packet *psbt.Packet) *txscript.MultiPrevOutFetcher {
 
 		if in.NonWitnessUtxo != nil {
 			prevIndex := txIn.PreviousOutPoint.Index
+			if prevIndex >= uint32(len(in.NonWitnessUtxo.TxOut)) {
+				// The PSBT is malformed: the unsigned tx spends
+				// an output the attached previous tx does not
+				// have. Skip it instead of panicking; callers
+				// see a missing prevout and fail cleanly.
+				continue
+			}
 			fetcher.AddPrevOut(
 				txIn.PreviousOutPoint,
 				in.NonWitnessUtxo.TxOut[prevIndex],
