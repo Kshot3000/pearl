@@ -136,7 +136,7 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 		ttl:      ttl,
 	}
 
-	if rec.statusCode == http.StatusOK {
+	if rec.statusCode == http.StatusOK && !isJSONRPCError(entry.body) {
 		h.cache.set(method, entry)
 
 		h.logger.Debug("cached JSON-RPC response",
@@ -147,6 +147,20 @@ func (h Handler) fetchFromUpstream(r *http.Request, body []byte, next caddyhttp.
 	}
 
 	return entry, nil
+}
+
+// isJSONRPCError reports whether body is a JSON-RPC response carrying an
+// error. pearld reports RPC failures (node warming up, bad params, ...) as
+// HTTP 200 with an error field set, so the status code alone cannot keep
+// failures out of the cache: a cached error would be replayed to every
+// caller for the whole TTL, long after the node recovered. Bodies that do
+// not parse as a JSON-RPC response are not treated as errors.
+func isJSONRPCError(body []byte) bool {
+	var resp jsonrpcResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	return len(resp.Error) > 0 && string(resp.Error) != "null"
 }
 
 // cache holds the per-method cached responses behind a mutex.
