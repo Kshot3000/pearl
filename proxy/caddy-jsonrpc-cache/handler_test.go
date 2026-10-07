@@ -277,3 +277,33 @@ func resultOf(t *testing.T, w *httptest.ResponseRecorder) string {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	return string(resp.Result)
 }
+
+// TestCacheEvictsExpiredEntries ensures stale entries do not accumulate
+// for the life of the process: with params in the key, each distinct
+// params value is a distinct entry, so expired entries must be dropped
+// on access and swept on insert.
+func TestCacheEvictsExpiredEntries(t *testing.T) {
+	c := &cache{entries: make(map[string]*cacheEntry)}
+	stale := &cacheEntry{
+		body:     []byte(`{"result":1}`),
+		storedAt: time.Now().Add(-time.Minute),
+		ttl:      time.Millisecond,
+	}
+	c.set("getblocktemplate\x00{\"a\":1}", stale)
+	require.Empty(t, c.entries, "expired entry must be swept on set")
+
+	live := &cacheEntry{
+		body:     []byte(`{"result":2}`),
+		storedAt: time.Now(),
+		ttl:      time.Minute,
+	}
+	c.set("getblocktemplate\x00{\"a\":2}", live)
+	require.Len(t, c.entries, 1)
+
+	// An entry that expires while resident is dropped on get.
+	live.storedAt = time.Now().Add(-time.Minute)
+	live.ttl = time.Millisecond
+	_, ok := c.get("getblocktemplate\x00{\"a\":2}")
+	require.False(t, ok)
+	require.Empty(t, c.entries, "expired entry must be evicted on get")
+}

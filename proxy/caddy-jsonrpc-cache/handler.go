@@ -164,16 +164,33 @@ type cache struct {
 }
 
 func (c *cache) get(key string) (*cacheEntry, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	e, ok := c.entries[key]
+	if ok && !e.fresh() {
+		// Evict on access: expired entries must not accumulate.
+		// Keys embed the request params, so each distinct params
+		// value is a distinct entry, and without eviction a caller
+		// minting distinct params could grow the map for the life
+		// of the process.
+		delete(c.entries, key)
+		return nil, false
+	}
 	return e, ok
 }
 
 func (c *cache) set(key string, entry *cacheEntry) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.entries[key] = entry
-	c.mu.Unlock()
+
+	// Sweep every expired entry on insert, so retained memory is
+	// bounded to entries still inside their TTL window.
+	for k, e := range c.entries {
+		if !e.fresh() {
+			delete(c.entries, k)
+		}
+	}
 }
 
 func (c *cache) clear() {
