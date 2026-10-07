@@ -385,6 +385,15 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 		return err
 	}
 
+	// InputsReadyToSign only checks that a UTXO field is present, not
+	// that a NonWitnessUtxo actually has the output the unsigned tx
+	// spends. Validate the indices here, before the sighash cache is
+	// built: PsbtPrevOutputFetcher skips a malformed input, and
+	// NewTxSigHashes dereferences the prevout it then cannot find.
+	if err := checkNonWitnessUtxoIndices(packet); err != nil {
+		return err
+	}
+
 	// Go through each input that doesn't have final witness data attached
 	// to it already and try to sign it. We do expect that we're the last
 	// ones to sign. If there is any input without witness data that we
@@ -515,6 +524,34 @@ func (w *Wallet) FinalizePsbt(keyScope *waddrmgr.KeyScope, account uint32,
 	return nil
 }
 
+// checkNonWitnessUtxoIndices verifies that every input carrying a
+// NonWitnessUtxo spends an output index that previous transaction
+// actually has, returning a descriptive error for the first malformed
+// input. Callers must run it before handing PsbtPrevOutputFetcher's
+// output to code that dereferences fetched prevouts (such as
+// txscript.NewTxSigHashes): the fetcher skips malformed inputs, so
+// without this check a missing prevout becomes a nil dereference
+// instead of this error.
+func checkNonWitnessUtxoIndices(packet *psbt.Packet) error {
+	for idx, txIn := range packet.UnsignedTx.TxIn {
+		in := packet.Inputs[idx]
+		if in.NonWitnessUtxo == nil {
+			continue
+		}
+
+		prevIndex := txIn.PreviousOutPoint.Index
+		if prevIndex >= uint32(len(in.NonWitnessUtxo.TxOut)) {
+			return fmt.Errorf("input %d has malformed "+
+				"NonWitnessUtxo: unsigned tx spends "+
+				"output index %d but the previous tx "+
+				"has only %d outputs", idx, prevIndex,
+				len(in.NonWitnessUtxo.TxOut))
+		}
+	}
+
+	return nil
+}
+
 // PsbtPrevOutputFetcher returns a txscript.PrevOutFetcher built from the UTXO
 // information in a PSBT packet.
 func PsbtPrevOutputFetcher(packet *psbt.Packet) *txscript.MultiPrevOutFetcher {
@@ -532,8 +569,9 @@ func PsbtPrevOutputFetcher(packet *psbt.Packet) *txscript.MultiPrevOutFetcher {
 			if prevIndex >= uint32(len(in.NonWitnessUtxo.TxOut)) {
 				// The PSBT is malformed: the unsigned tx spends
 				// an output the attached previous tx does not
-				// have. Skip it instead of panicking; callers
-				// see a missing prevout and fail cleanly.
+				// have. Skip it instead of panicking;
+				// FinalizePsbt rejects such packets up front
+				// via checkNonWitnessUtxoIndices.
 				continue
 			}
 			fetcher.AddPrevOut(

@@ -525,3 +525,37 @@ func TestPsbtPrevOutputFetcherIndexOutOfRange(t *testing.T) {
 	fetcher := PsbtPrevOutputFetcher(packet)
 	require.Nil(t, fetcher.FetchPrevOutput(outPoint))
 }
+
+// TestFinalizePsbtMalformedNonWitnessIndex ensures FinalizePsbt rejects a
+// packet whose NonWitnessUtxo index is out of range with an error, instead
+// of panicking inside the sighash cache construction (which dereferences
+// the prevout the fetcher skipped) before the signing loop's own bounds
+// check can run.
+func TestFinalizePsbtMalformedNonWitnessIndex(t *testing.T) {
+	prevHash := chainhash.Hash{0x01}
+	outPoint := wire.OutPoint{Hash: prevHash, Index: 5}
+	packet := &psbt.Packet{
+		UnsignedTx: &wire.MsgTx{
+			TxIn: []*wire.TxIn{
+				{PreviousOutPoint: outPoint},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 900, PkScript: testScriptP2TR1},
+			},
+		},
+		Inputs: []psbt.PInput{
+			{
+				NonWitnessUtxo: &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{Value: 1000, PkScript: testScriptP2TR1},
+					},
+				},
+			},
+		},
+		Outputs: []psbt.POutput{{}},
+	}
+
+	w := &Wallet{}
+	err := w.FinalizePsbt(nil, 0, packet)
+	require.ErrorContains(t, err, "malformed NonWitnessUtxo")
+}
