@@ -141,18 +141,22 @@ func (c *Cache[K, V]) Put(key K, value V) (bool, error) {
 			"cache with capacity %v", vs, c.capacity)
 	}
 
-	// Load the element.
-	el, ok := c.cache.Load(key)
-
-	// Update the internal list inside a lock.
+	// Update the internal list inside a lock. The lookup of any
+	// existing element and the store of its replacement happen under
+	// the same lock hold as the list and size mutations: loading the
+	// element before acquiring the lock (and storing after releasing
+	// it) let a concurrent LoadAndDelete or Put for the same key
+	// interleave, so this Put then mutated the list and size
+	// accounting for an element that was no longer the one in the
+	// map — subtracting its size a second time, or orphaning the
+	// newer element in the list, counted but unreachable via Get.
 	c.mtx.Lock()
+	defer c.mtx.Unlock()
 
 	// If the element already exists, remove it and decrease cache's size.
-	if ok {
+	if el, ok := c.cache.Load(key); ok {
 		es, err := el.Value.value.Size()
 		if err != nil {
-			c.mtx.Unlock()
-
 			return false, fmt.Errorf("couldn't determine size of "+
 				"existing cache value %v", err)
 		}
@@ -165,19 +169,16 @@ func (c *Cache[K, V]) Put(key K, value V) (bool, error) {
 	// elements if we need more space.
 	evicted, err := c.evict(vs)
 	if err != nil {
-		c.mtx.Unlock()
-
 		return false, err
 	}
 
 	// We have made enough space in the cache, so just insert it.
-	el = c.ll.PushFront(entry[K, V]{key: key, value: value})
+	el := c.ll.PushFront(entry[K, V]{key: key, value: value})
 	c.size += vs
 
-	// Release the lock.
-	c.mtx.Unlock()
-
-	// Update the cache.
+	// Update the cache while still holding the lock, so the map, the
+	// list and the size accounting change atomically with respect to
+	// every other cache operation.
 	c.cache.Store(key, el)
 
 	return evicted, nil
