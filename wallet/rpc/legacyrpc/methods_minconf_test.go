@@ -66,6 +66,14 @@ func TestHandlersRejectOutOfRangeConfCounts(t *testing.T) {
 					MinConf: intPtr(minConf),
 				}, nil)
 		}},
+		{"listreceivedbyaddress", func(minConf int) (interface{}, error) {
+			includeEmpty := false
+			return listReceivedByAddress(
+				&btcjson.ListReceivedByAddressCmd{
+					MinConf:      intPtr(minConf),
+					IncludeEmpty: &includeEmpty,
+				}, nil)
+		}},
 		{"listunspent", func(minConf int) (interface{}, error) {
 			return listUnspent(&btcjson.ListUnspentCmd{
 				MinConf: intPtr(minConf),

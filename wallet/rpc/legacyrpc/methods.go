@@ -1147,6 +1147,11 @@ func listReceivedByAccount(icmd interface{}, w *wallet.Wallet) (interface{}, err
 func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, error) {
 	cmd := icmd.(*btcjson.ListReceivedByAddressCmd)
 
+	minConf, err := checkedConfCount("minconf", *cmd.MinConf)
+	if err != nil {
+		return nil, err
+	}
+
 	// Intermediate data for each address.
 	type AddrData struct {
 		// Total amount received.
@@ -1174,12 +1179,11 @@ func listReceivedByAddress(icmd interface{}, w *wallet.Wallet) (interface{}, err
 		allAddrData[address] = AddrData{}
 	}
 
-	minConf := *cmd.MinConf
 	var endHeight int32
 	if minConf == 0 {
 		endHeight = -1
 	} else {
-		endHeight = syncBlock.Height - int32(minConf) + 1
+		endHeight = syncBlock.Height - minConf + 1
 	}
 	err = wallet.UnstableAPI(w).RangeTransactions(0, endHeight, func(details []wtxmgr.TxDetails) (bool, error) {
 		confirmations := confirms(details[0].Block.Height, syncBlock.Height)
