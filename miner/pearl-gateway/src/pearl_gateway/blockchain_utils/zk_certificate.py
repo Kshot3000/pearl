@@ -61,6 +61,15 @@ class ZKCertificate:
     ZK_MAX_PUBLIC_DATA_SIZE_V2: ClassVar[int] = 4807
 
     def __post_init__(self) -> None:
+        if len(self.header_hash) != 32:
+            # Both wire layouts carry the header hash in a fixed
+            # 32-byte field; numpy would otherwise silently zero-pad
+            # or truncate it, and the serialized certificate would
+            # commit to a different header than the caller set.
+            raise ValueError(
+                f"Header hash must be exactly 32 bytes, "
+                f"got {len(self.header_hash)} bytes"
+            )
         if len(self.proof.proof_data) > self.ZK_MAX_PROOF_DATA_SIZE:
             raise ValueError(
                 f"Proof data is too large: {len(self.proof.proof_data)} bytes "

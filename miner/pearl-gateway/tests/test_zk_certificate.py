@@ -100,6 +100,45 @@ class TestDeserializeLengthValidation:
         assert back.serialize() == wire
 
 
+class TestHeaderHashSizeValidation:
+    """The header hash sits in a fixed 32-byte field in both wire
+    layouts: construction must not silently zero-pad or truncate it,
+    or the serialized certificate commits to a different header than
+    the caller set."""
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            CertificateVersion.ZK_DENSE,
+            CertificateVersion.ZK_MOE,
+            CertificateVersion.ZK_V3,
+        ],
+    )
+    def test_short_header_hash_rejected(self, version):
+        with pytest.raises(ValueError):
+            ZKCertificate(
+                header_hash=b"short",
+                proof=ZKProof(bytes([7] * PUBLICDATA_SIZE), b"\x09" * 100),
+                cert_version=version,
+            )
+
+    @pytest.mark.parametrize(
+        "version",
+        [
+            CertificateVersion.ZK_DENSE,
+            CertificateVersion.ZK_MOE,
+            CertificateVersion.ZK_V3,
+        ],
+    )
+    def test_long_header_hash_rejected(self, version):
+        with pytest.raises(ValueError):
+            ZKCertificate(
+                header_hash=b"x" * 40,
+                proof=ZKProof(bytes([7] * PUBLICDATA_SIZE), b"\x09" * 100),
+                cert_version=version,
+            )
+
+
 class TestPublicDataSizeValidation:
     """The dense wire field is fixed-size: serialize must not silently
     zero-pad or truncate public data (the proof commitment is hashed
