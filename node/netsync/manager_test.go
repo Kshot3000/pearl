@@ -6,6 +6,7 @@ package netsync
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -441,14 +442,16 @@ func TestAnyPeerAnnouncedUnknownBlockEligibility(t *testing.T) {
 }
 
 // TestAtTipSyncPromotionBlocked pins the at-tip promotion bar:
-// while the chain is current, no candidate may be promoted in a way
-// that flips current() false — neither on its unauthenticated
-// version height alone, nor on an unverified announced hash paired
-// with an advertised height above ours. The honest next-block
-// announcer (announced a block we lack, advertised height at or
-// below ours, because its LastBlock only advances on blocks we
-// accepted) is still promoted, and nothing is barred once the
-// chain is not current.
+// while the chain is current, no candidate may be promoted at all.
+// The pre-promotion checks cannot make a promotion safe: they only
+// inspect the candidate's advertised height at selection time, but
+// once the peer is the sync peer an orphan it serves raises its
+// LastBlock to the block's unauthenticated coinbase height
+// (handleBlockMsg), which flips current() false and silences every
+// other peer's announcements until the stall timer fires. Nothing
+// is barred once the chain is not current, and while current a
+// promotion is not needed to fetch an announced block: with no
+// sync peer, handleInvMsg fetches announcements directly.
 func TestAtTipSyncPromotionBlocked(t *testing.T) {
 	unknown := &chainhash.Hash{0x07}
 
@@ -465,12 +468,72 @@ func TestAtTipSyncPromotionBlocked(t *testing.T) {
 	assert.True(t, atTipSyncPromotionBlocked(true, unknown, 11, 10),
 		"current + announced block + advertised height above ours: "+
 			"blocked, the promotion would flip current() false")
-	assert.False(t, atTipSyncPromotionBlocked(true, unknown, 10, 10),
+	assert.True(t, atTipSyncPromotionBlocked(true, unknown, 10, 10),
 		"current + announced block + advertised height at ours: "+
-			"promoted, current() stays true")
-	assert.False(t, atTipSyncPromotionBlocked(true, unknown, 9, 10),
+			"blocked, the promoted peer can raise its height on "+
+			"an orphan's coinbase claim after promotion")
+	assert.True(t, atTipSyncPromotionBlocked(true, unknown, 9, 10),
 		"current + announced block + advertised height below ours: "+
-			"promoted, current() stays true")
+			"blocked, the promoted peer can raise its height on "+
+			"an orphan's coinbase claim after promotion")
+}
+
+// TestAnyPeerAnnouncedUnknownBlockSpent pins the stand-down bound
+// when there are more announcers than fit inside one cooldown
+// window. The previous bound relied on every announcer sitting in
+// syncPeerCooldown at once; with the default eight outbound peers
+// that can never happen — each promotion burns a full
+// maxStallDuration before its announcer enters the 10-minute
+// cooldown, so early cooldowns expire while later announcers are
+// still being tried, and some eligible announcer is always outside
+// cooldown, standing rotation down forever. An announcer that has
+// already stalled once over the very hash it announced has had its
+// chance: that announcement must never stand rotation down again,
+// however long ago the stall was. A new announcement from the same
+// peer counts again.
+func TestAnyPeerAnnouncedUnknownBlockSpent(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	unknown := chainhash.Hash{0x07}
+
+	mkPeer := func(addr string) *peer.Peer {
+		t.Helper()
+		p, err := peer.NewOutboundPeer(
+			&peer.Config{ChainParams: sm.chainParams}, addr)
+		require.NoError(t, err)
+		h := unknown
+		p.UpdateLastAnnouncedBlock(&h)
+		sm.peerStates[p] = &peerSyncState{syncCandidate: true}
+		return p
+	}
+
+	// More announcers than a 10-minute cooldown divided by a
+	// 3-minute stall cycle can hold at once.
+	announcers := make([]*peer.Peer, 0, 5)
+	for i := 0; i < 5; i++ {
+		announcers = append(announcers,
+			mkPeer(fmt.Sprintf("10.0.1.%d:44108", i+1)))
+	}
+	require.True(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"eligible announcers stand rotation down before any has stalled")
+
+	// Each announcer in turn is promoted, stalls over its
+	// announcement, and cools down; by the time the later ones
+	// have stalled, the earlier cooldowns have expired, so no
+	// announcer is in cooldown when the last one finishes.
+	for _, p := range announcers {
+		sm.coolDownSyncCandidate(p)
+		sm.recentlyFailedSync[p.Addr()] =
+			time.Now().Add(-syncPeerCooldown - time.Second)
+	}
+	assert.False(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"every announcer has stalled over its announcement: the "+
+			"stand-down must lift even with nobody in cooldown")
+
+	// A fresh announcement from a spent announcer counts again.
+	fresh := chainhash.Hash{0x09}
+	announcers[0].UpdateLastAnnouncedBlock(&fresh)
+	assert.True(t, sm.anyPeerAnnouncedUnknownBlock(),
+		"a new announcement from a spent announcer counts again")
 }
 
 // TestStartSyncPromotesHeightClaimWhenNotCurrent pins that the at-tip
