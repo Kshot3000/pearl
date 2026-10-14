@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/big"
 	"math/rand"
 	"net"
@@ -3618,9 +3619,33 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	return tx.Hash().String(), nil
 }
 
+// validateSetGenerateCmd rejects a generation process limit that does
+// not fit in an int32. The handler narrows the limit to int32 for
+// CPUMiner.SetNumWorkers; an unchecked value of 2^32 wrapped to 0, which
+// SetNumWorkers treats as a stop signal, and 2^31 wrapped negative,
+// which it treats as "use the default", so a caller asking for an
+// enormous worker count silently got a stopped miner or the default
+// instead. A negative limit never wraps in a harmful direction
+// (SetNumWorkers maps every negative value to the default worker
+// count), so it stays accepted at any magnitude.
+func validateSetGenerateCmd(c *btcjson.SetGenerateCmd) error {
+	if c.GenProcLimit != nil && *c.GenProcLimit > math.MaxInt32 {
+		return &btcjson.RPCError{
+			Code: btcjson.ErrRPCInvalidParameter,
+			Message: fmt.Sprintf("GenProcLimit exceeds maximum "+
+				"allowed (%d)", int64(math.MaxInt32)),
+		}
+	}
+	return nil
+}
+
 // handleSetGenerate implements the setgenerate command.
 func handleSetGenerate(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (interface{}, error) {
 	c := cmd.(*btcjson.SetGenerateCmd)
+
+	if err := validateSetGenerateCmd(c); err != nil {
+		return nil, err
+	}
 
 	// Disable generation regardless of the provided generate flag if the
 	// maximum number of threads (goroutines for our purposes) is 0.
