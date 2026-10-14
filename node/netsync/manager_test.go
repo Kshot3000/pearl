@@ -243,6 +243,20 @@ func TestInvGateWithoutSyncPeer(t *testing.T) {
 // selected — it may simply be waiting for the same next block we are —
 // and an inbound peer is never selected because disconnecting one
 // frees no outbound slot for the connection manager to refill.
+//
+// Announcing our tip does NOT exempt a peer. LastAnnouncedBlock is
+// written in handleInvMsg from an unauthenticated inv, before any
+// possession check, and the node never requests a hash it already
+// has — so in the not-current state where rotation runs, an
+// announcement of the tip is unverifiable: the tip hash is public
+// (any peer can learn it, e.g. via getblocks) and a peer that is
+// still behind can repeat it without holding the block. The height
+// update that would prove possession only runs while the chain is
+// current (handleInvMsg), and rotation never runs then. A peer that
+// announced our tip while we were current already had its LastBlock
+// raised to the tip height by that path, so the height rule above
+// protects every verifiable holder; the unverifiable claim must not
+// protect a liar instead.
 func TestPickStaleOutboundPeer(t *testing.T) {
 	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
 
@@ -270,21 +284,24 @@ func TestPickStaleOutboundPeer(t *testing.T) {
 	mkPeer(false, "10.0.0.2:44108", 5)
 	mkPeer(true, "10.0.0.3:44108", 1)
 
-	// A peer advertising a low height whose last announced block is
-	// our tip provably holds the tip — LastBlock is only a lower
-	// bound — so it must never be rotated, even though it advertises
-	// the lowest height of all.
+	// A peer advertising the lowest height whose last announced
+	// block is our tip: the announcement is an unauthenticated inv
+	// of a public hash, not proof of possession, so it must not
+	// exempt the peer — it is picked first, ahead of the
+	// higher-advertising peer that announced some other hash.
 	quiet := mkPeer(false, "10.0.0.4:44108", 1)
 	quiet.UpdateLastAnnouncedBlock(tipHash)
 
-	assert.Equal(t, low, sm.pickStaleOutboundPeer(10, tipHash),
-		"the lowest strictly-behind outbound peer must be picked")
-	assert.Nil(t, sm.pickStaleOutboundPeer(2, tipHash),
+	assert.Equal(t, quiet, sm.pickStaleOutboundPeer(10),
+		"announcing the tip must not exempt a strictly-behind peer: "+
+			"the announcement is unverified and the hash is public")
+	delete(sm.peerStates, quiet)
+	assert.Equal(t, low, sm.pickStaleOutboundPeer(10),
+		"the lowest remaining strictly-behind outbound peer must be picked")
+	assert.Nil(t, sm.pickStaleOutboundPeer(2),
 		"a peer at our height must never be rotated")
-	assert.Nil(t, sm.pickStaleOutboundPeer(0, tipHash),
+	assert.Nil(t, sm.pickStaleOutboundPeer(0),
 		"no peer can be below genesis height")
-	assert.Equal(t, quiet, sm.pickStaleOutboundPeer(10, otherHash),
-		"the announced-tip exemption must follow the actual tip hash")
 }
 
 // TestHandleStallSampleNoSyncPeer pins the stall-sample accounting for
@@ -534,6 +551,68 @@ func TestAnyPeerAnnouncedUnknownBlockSpent(t *testing.T) {
 	announcers[0].UpdateLastAnnouncedBlock(&fresh)
 	assert.True(t, sm.anyPeerAnnouncedUnknownBlock(),
 		"a new announcement from a spent announcer counts again")
+}
+
+// TestStartSyncSkipsSpentAnnouncement pins that an announcement a
+// peer has already stalled over is nothing new to startSync. The
+// stand-down bound (announcementSpent) only lifts rotation's freeze
+// if the spent announcer cannot simply be promoted again on the same
+// hash once its cooldown expires: each such promotion also zeroes
+// noSyncPeerSamples in handleStallSample, restarting the rotation
+// grace, so a cycle of three or more spent announcers — each
+// promoted in turn, stalling for maxStallDuration, then cooling
+// down — keeps the grace from ever elapsing and rotation never
+// disconnects anyone. A spent candidate is skipped exactly like a
+// candidate whose announced block we already have. A fresh
+// announcement from the same peer promotes again.
+func TestStartSyncSkipsSpentAnnouncement(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+	require.False(t, sm.chain.IsCurrent())
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	spent := chainhash.Hash{0x07}
+	p.UpdateLastAnnouncedBlock(&spent)
+	if sm.announcementSpent == nil {
+		sm.announcementSpent = make(map[string]chainhash.Hash)
+	}
+	sm.announcementSpent[p.Addr()] = spent
+
+	sm.handleNewPeerMsg(p)
+	assert.Nil(t, sm.syncPeer,
+		"a candidate whose only announcement is spent must not be promoted")
+
+	// A new announcement from the same peer is new evidence and
+	// promotes as usual.
+	fresh := chainhash.Hash{0x09}
+	p.UpdateLastAnnouncedBlock(&fresh)
+	sm.startSync()
+	assert.Equal(t, p, sm.syncPeer,
+		"a fresh announcement from a spent announcer must promote")
+}
+
+// TestHandleStallSampleSpentKeepsStreak pins the rotation-grace half
+// of the spent-promotion fix: a stall sample whose only candidate
+// carries a spent announcement must extend the no-candidate streak,
+// not reset it via a promotion that can never deliver.
+func TestHandleStallSampleSpentKeepsStreak(t *testing.T) {
+	sm := newTestSyncManager(t, &chaincfg.RegressionNetParams)
+
+	p, _ := connectedTestPeer(t, sm.chainParams, false)
+	spent := chainhash.Hash{0x07}
+	p.UpdateLastAnnouncedBlock(&spent)
+	if sm.announcementSpent == nil {
+		sm.announcementSpent = make(map[string]chainhash.Hash)
+	}
+	sm.announcementSpent[p.Addr()] = spent
+	sm.handleNewPeerMsg(p)
+	require.Nil(t, sm.syncPeer)
+
+	sm.noSyncPeerSamples = 3
+	sm.handleStallSample()
+	assert.Nil(t, sm.syncPeer,
+		"the spent announcer must not be promoted on a stall sample")
+	assert.Equal(t, 4, sm.noSyncPeerSamples,
+		"a candidate-less sample must extend the streak, not reset it")
 }
 
 // TestStartSyncPromotesHeightClaimWhenNotCurrent pins that the at-tip

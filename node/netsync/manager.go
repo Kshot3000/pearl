@@ -283,15 +283,20 @@ type SyncManager struct {
 	// announcementSpent records, per outbound peer address, the
 	// announced block hash over which that peer has already
 	// stalled once (as sync peer, or by withholding a requested
-	// block — see coolDownSyncCandidate). Such an announcement no
-	// longer stands the no-candidate rotation down: the announcer
-	// had its chance to deliver that block and did not, so counting
-	// it again after its cooldown expires would let a set of
+	// block — see coolDownSyncCandidate). Such an announcement is
+	// nothing new anywhere it is consulted: it no longer stands
+	// the no-candidate rotation down (the announcer had its
+	// chance to deliver that block and did not, so counting it
+	// again after its cooldown expires would let a set of
 	// announcers larger than one cooldown window keep rotation
 	// frozen forever, each leaving cooldown while the next is
-	// still being tried. A different announcement from the same
-	// peer replaces the entry and counts again. Only accessed
-	// from the blockHandler thread.
+	// still being tried), and startSync no longer promotes the
+	// announcer on it (each such promotion would also reset the
+	// rotation grace in handleStallSample, so a cycle of spent
+	// announcers could keep the grace from ever elapsing). A
+	// different announcement from the same peer replaces the
+	// entry and counts again. Only accessed from the
+	// blockHandler thread.
 	announcementSpent map[string]chainhash.Hash
 
 	// noSyncPeerSamples counts consecutive stall samples on which no
@@ -451,6 +456,21 @@ func (sm *SyncManager) startSync() {
 			log.Debugf("Skipping sync: candidate %s only "+
 				"announced blocks we already have",
 				bestPeer.Addr())
+			return
+		}
+		// An announcement this peer already stalled over once
+		// is nothing new either (see announcementSpent):
+		// promoting it again would hand it a second stall
+		// cycle over the same hash, and handleStallSample
+		// resets the no-candidate rotation streak on any
+		// promotion, so a set of spent announcers taking
+		// turns being promoted could keep the rotation
+		// grace from ever elapsing.
+		if spent, ok := sm.announcementSpent[bestPeer.Addr()]; ok &&
+			spent.IsEqual(announced) {
+			log.Debugf("Skipping sync: candidate %s already "+
+				"stalled over its announced block %s",
+				bestPeer.Addr(), announced)
 			return
 		}
 	} else if bestPeer.LastBlock() <= best.Height {
@@ -737,7 +757,7 @@ func (sm *SyncManager) handleNoSyncPeer(isCurrent bool) {
 	}
 
 	best := sm.chain.BestSnapshot()
-	victim := sm.pickStaleOutboundPeer(best.Height, &best.Hash)
+	victim := sm.pickStaleOutboundPeer(best.Height)
 	if victim == nil {
 		return
 	}
@@ -774,6 +794,9 @@ func (sm *SyncManager) handleNoSyncPeer(isCurrent bool) {
 // announcer fitting inside one cooldown window at once: each
 // announcer can hold the stand-down only until its first stall
 // over the announcement, and there are finitely many announcers.
+// The same spent record keeps startSync from re-promoting the
+// announcer on that hash after its cooldown expires, which would
+// reset the rotation streak on every cycle.
 func (sm *SyncManager) anyPeerAnnouncedUnknownBlock() bool {
 	now := time.Now()
 	for peer, state := range sm.peerStates {
@@ -809,17 +832,24 @@ func (sm *SyncManager) anyPeerAnnouncedUnknownBlock() bool {
 //
 // LastBlock is only a lower bound on a peer's real height: it is set
 // at the version handshake and advances when the peer announces or
-// serves blocks, so it can lag a peer that quietly holds our tip. A
-// peer whose last announced block is our current tip provably holds
-// that tip whatever its LastBlock says, so it is never selected.
-func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32, bestHash *chainhash.Hash) *peerpkg.Peer {
+// serves blocks, so it can lag a peer that quietly holds our tip.
+// An earlier version exempted a peer whose last announced block was
+// our tip, treating the announcement as proof of possession. It is
+// not: LastAnnouncedBlock is written in handleInvMsg from an
+// unauthenticated inv before any possession check, the tip hash is
+// public (any peer can learn it, e.g. via getblocks), and the node
+// never requests a hash it already has, so the claim is never
+// tested — a peer that is still behind can repeat it and hold its
+// slot for as long as the tip is unchanged. The height update that
+// does prove possession (handleInvMsg raising LastBlock for a known
+// announced block) only runs while the chain is current, and
+// rotation never runs then, so every verifiable tip-holder is
+// already protected by the height rule above; the unverifiable
+// claim must not protect a liar instead.
+func (sm *SyncManager) pickStaleOutboundPeer(bestHeight int32) *peerpkg.Peer {
 	var victim *peerpkg.Peer
 	for peer := range sm.peerStates {
 		if peer.Inbound() || peer.LastBlock() >= bestHeight {
-			continue
-		}
-		if announced := peer.LastAnnouncedBlock(); announced != nil &&
-			announced.IsEqual(bestHash) {
 			continue
 		}
 		if victim == nil || peer.LastBlock() < victim.LastBlock() {
