@@ -38,10 +38,12 @@ func intPtrSetGenerate(v int) *int { return &v }
 // SetNumWorkers treats as a stop signal, and 2^31 became negative, which
 // it treats as "use the default" — so a caller asking for an enormous
 // worker count silently got a stopped miner or the default instead.
-// Values that do not fit in an int32 must be rejected instead. A negative
-// limit never wraps in a harmful direction (SetNumWorkers maps every
-// negative value to the default worker count), so it stays accepted at
-// any magnitude — semantics unchanged.
+// Values that do not fit in an int32 must be rejected instead. Negative
+// limits wrap in the opposite direction: below int32 min the cast lands
+// on a huge positive count (or on 0 at int64 min), so they are rejected
+// too. A negative limit inside the int32 range is safe — SetNumWorkers
+// maps it to the default worker count — and stays accepted, semantics
+// unchanged.
 func TestValidateSetGenerateCmd(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -67,9 +69,15 @@ func TestValidateSetGenerateCmd(t *testing.T) {
 			GenProcLimit: intPtrSetGenerate(math.MaxInt64)}, true},
 		{"limit negative is default", &btcjson.SetGenerateCmd{
 			GenProcLimit: intPtrSetGenerate(-7)}, false},
-		{"limit hugely negative still default",
+		{"limit at int32 min is default", &btcjson.SetGenerateCmd{
+			GenProcLimit: intPtrSetGenerate(math.MinInt32)}, false},
+		{"limit below int32 min wraps to int32 max",
 			&btcjson.SetGenerateCmd{
-				GenProcLimit: intPtrSetGenerate(math.MinInt64)}, false},
+				GenProcLimit: intPtrSetGenerate(math.MinInt32 - 1)},
+			true},
+		{"limit at int64 min wraps to zero",
+			&btcjson.SetGenerateCmd{
+				GenProcLimit: intPtrSetGenerate(math.MinInt64)}, true},
 	}
 
 	for _, tc := range tests {
@@ -110,10 +118,12 @@ func TestHandleSetGenerateRejectsOutOfRangeLimit(t *testing.T) {
 	s := &rpcServer{}
 
 	for _, params := range []string{
-		`[true,2147483648]`, // limit wraps to int32 min (default)
-		`[true,4294967296]`, // limit wraps to 0 (stop)
-		`[true,4294967301]`, // limit wraps to 5
-		`[true,8589934592]`, // limit wraps to 0 at 2^33
+		`[true,2147483648]`,  // limit wraps to int32 min (default)
+		`[true,4294967296]`,  // limit wraps to 0 (stop)
+		`[true,4294967301]`,  // limit wraps to 5
+		`[true,8589934592]`,  // limit wraps to 0 at 2^33
+		`[true,-2147483649]`, // limit wraps to int32 max (worker flood)
+		`[true,-4294967296]`, // limit wraps to 0 at -2^32 (stop)
 	} {
 		cmd := setGenerateCmdViaWire(t, params)
 		result, err := handleSetGenerate(s, cmd, make(chan struct{}))
